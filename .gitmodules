@@ -1,0 +1,4 @@
+[submodule "alpine-linux-v3.13.5"]
+	path = source/upstream/alpine-linux/3.13.5
+	url = https://github.com/alpinelinux/docker-alpine
+	branch = v3.13

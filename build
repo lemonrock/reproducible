@@ -1,0 +1,253 @@
+#/usr/bin/env sh
+# This file is part of reproducible-rust. It is subject to the license terms in the COPYRIGHT file found in the top-level directory of this distribution and at https://raw.githubusercontent.com/lemonrock/reproducible-rust/master/COPYRIGHT. No part of reproducible-rust, including this file, may be copied, modified, propagated, or distributed except according to the terms contained in the COPYRIGHT file.
+# Copyright © 2021 The developers of reproducible-rust. See the COPYRIGHT file in the top-level directory of this distribution and at https://raw.githubusercontent.com/lemonrock/reproducible-rust/master/COPYRIGHT.
+
+
+set -e
+set -u
+set -f
+
+_program_path_find()
+{
+	if [ "${0%/*}" = "$0" ]; then
+
+		# We've been invoked by the interpreter as, say, bash program
+		if [ -r "$0" ]; then
+			pwd -P
+		# Clutching at straws; probably run via a download, anonymous script, etc, weird execve, etc
+		else
+			printf '\n'
+		fi
+
+	else
+
+		# We've been invoked with a relative or absolute path (also when invoked via PATH in a shell)
+
+		_program_path_find_parentPath()
+		{
+			parentPath="${scriptPath%/*}"
+			if [ -z "$parentPath" ]; then
+				parentPath='/'
+			fi
+			cd "$parentPath" 1>/dev/null
+		}
+
+		# pdksh / mksh have problems with unsetting a variable that was never set...
+		if [ "${CDPATH+set}" = 'set' ]; then
+			unset CDPATH
+		fi
+
+		if command -v realpath 1>/dev/null 2>/dev/null; then
+			(
+				scriptPath="$(realpath "$0")"
+
+				_program_path_find_parentPath
+				pwd -P
+			)
+		elif command -v readlink 1>/dev/null 2>/dev/null; then
+			(
+				local recursionDepth=0
+				_program_path_resolve_symlinks_recursively()
+				{
+					local unresolvedPath="$1"
+					
+					recursionDepth=$((recursionDepth + 1))
+					
+					if [ $recursionDepth -gt 10 ]; then
+						printf '%s\n' 'Recursion to depths greater than 10 is not allowed when resolving links.'
+						return 1
+					fi
+					
+					local potentialLinkDestination="$(readlink -- "$unresolvedPath")"
+					
+					if [ -z "$potentialLinkDestination" ]; then
+						scriptPath="$unresolvedPath"
+						return 0
+					fi
+					local linkDestination="$potentialLinkDestination"
+					local parentFolderPath="${unresolvedPath%/*}"
+					
+					if [ "$parentFolderPath" = "$unresolvedPath" ]; then
+						_program_path_resolve_symlinks_recursively "$linkDestination"
+					else
+						case "$linkDestination" in
+														
+							/*)
+								_program_path_resolve_symlinks_recursively "$linkDestination"
+							;;
+							
+							*)
+								_program_path_resolve_symlinks_recursively "$parentFolderPath"/"$linkDestination"
+							;;
+							
+						esac
+					fi
+				}
+
+				scriptPath="$0"
+				_program_path_resolve_symlinks_recursively "$scriptPath"
+
+				_program_path_find_parentPath
+				pwd -P
+			)
+		else
+			# This approach will fail in corner cases where the script itself is a symlink in a path not parallel with the concrete script
+			(
+				scriptPath="$0"
+
+				_program_path_find_parentPath
+				pwd -P
+			)
+		fi
+
+	fi
+}
+
+cd "$(_program_path_find)" 1>/dev/null 2>/dev/null
+
+. functions/common.sh
+. functions/common.outside-docker.sh
+. functions/docker.sh
+
+guard_arguments()
+{
+	local message="Specify an ARCHITECTURE and IMAGE to build, eg ./build.sh x86_64 base; ARCHITECTURE is aarch64, powerpc64le, riscv64, s390x or x86_64 (not a Docker platform name, which is derived)"
+	
+	case $# in
+		
+		0)	
+			exit_usage_message "$message"
+		;;
+		
+		1)
+			case "$1" in
+				
+				-h|-help|--help|help)
+					exit_help_message "$message"
+				;;
+				
+				*)
+					exit_usage_message "$message"
+				;;
+				
+			esac
+		;;
+			
+		*)
+			architecture="$1"
+			image="$2"
+			
+			validate_architecture "$architecture"
+		;;
+		
+	esac
+}
+
+set_image_configuration_paths()
+{
+	docker_image_source_folder_path="$source_folder_path"/image/"$image"/"$architecture"
+	exit_if_folder_missing "$docker_image_source_folder_path"
+	
+	exit_if_configuration_file_missing "$docker_image_source_folder_path"/Dockerfile
+	exit_if_configuration_file_missing "$docker_image_source_folder_path"/.dockerignore
+}
+
+depends head rm
+validate_if_git_has_changed()
+{
+	git_describe="$(git_fully_describe)"
+	if [ -e "$git_describe_file_path" ]; then
+		local was_git_describe="$(head -n 1 "$git_describe_file_path")"
+		if [ "$was_git_describe" = "$git_describe" ]; then
+			exit 0
+		fi
+	fi
+	
+	rm -rf "$output_image_identifier_file_path"
+	rm -rf "$git_describe_file_path"
+}
+
+depends git
+git_fully_describe()
+{
+	git describe --dirty --long --abbrev=64
+}
+
+depends awk
+build_image_dependencies()
+{	
+	local image_dependencies_file_path="$TMPDIR"/image-dependencies
+	awk '$1 ~ /^FROM$/ && $(NF) ~ /^stormmq\// {print $(NF)}' "$docker_image_source_folder_path"/Dockerfile >"$image_dependencies_file_path"
+	
+	local namespace
+	local name
+	local version
+	local junk
+	while IFS='/:' read -r namespace name version junk
+	do
+		./build "$architecture" "$name"
+	done <"$image_dependencies_file_path"
+}
+
+# Docker does not like symlinks that point outside of the docker image.
+depends mkdir rsync
+create_docker_image()
+{
+	docker_image_folder_path="$TMPDIR"/docker-image
+	mkdir -m 0700 -p "$docker_image_folder_path"
+	
+	rsync --recursive --links --copy-links --copy-unsafe-links --executability --devices --specials --times --whole-file "$docker_image_source_folder_path"/ "$docker_image_folder_path"/
+}
+
+depends docker
+build_using_docker()
+{
+	clean_folder "$image_output_folder_path"
+	
+	/usr/bin/env -i PATH="$PATH" HOME="$HOME" DOCKER_BUILDKIT=1 docker build --quiet --disable-content-trust --force-rm --rm --iidfile "$output_image_identifier_file_path" --isolation default --network default --no-cache=true --platform "$docker_platform" --tag stormmq/"$image":latest "$@" -- "$docker_image_folder_path" 1>/dev/null
+	
+	printf '\n' >>"$output_image_identifier_file_path"
+}
+
+record_git_describe()
+{
+	printf '%s\n' "$git_describe" >"$git_describe_file_path"
+}
+
+main()
+{
+	local docker_platform
+	local architecture
+	local image
+	guard_arguments "$@"
+	shift 2
+	
+	local output_folder_path
+	local source_folder_path
+	local temporary_folder_path
+	set_paths
+	
+	local image_output_folder_path
+	local output_image_identifier_file_path
+	local git_describe_file_path
+	set_image_output_paths
+	
+	local docker_image_source_folder_path
+	set_image_configuration_paths
+	
+	local git_describe
+	validate_if_git_has_changed
+	
+	make_temporary_folder
+	
+	build_image_dependencies
+	
+	local docker_image_folder_path
+	create_docker_image
+	
+	build_using_docker
+	
+	record_git_describe
+}
+
+main "$@"
