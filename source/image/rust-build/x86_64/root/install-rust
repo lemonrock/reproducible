@@ -103,53 +103,112 @@ _program_path_find()
 	fi
 }
 
-convert_target_platform()
+cd "$(_program_path_find)" 1>/dev/null 2>/dev/null
+
+. common.sh
+. common.inside-docker.sh
+. rust.sh
+
+depends mv rmdir
+move_files_into_place()
 {
-	case "$TARGETPLATFORM" in
-		
-		'linux/arm64')
-			architecture=x86_64
-		;;
+	local noarch_download_folder_path="$download_folder_path"/noarch
+	local target_specific_download_folder_path="$download_folder_path"/"$target_triple"
 	
-		'linux/riscv64')
-			architecture=riscv64
-		;;
-	
-		'linux/ppc64le')
-			architecture='powerpc64le'
-		;;
-	
-		'linux/s390x')
-			architecture='s390x'
-		;;
+	local date
+	while IFS=' ' read -r date junk
+	do
+		case "$date" in
+			
+			'')
+				continue
+			;;
 		
-		*)
-			exit_configuration_message "Unsupported TARGETPLATFORM $TARGETPLATFORM"
-		;;
+			'#'*)
+				continue
+			;;
 		
-	esac
+			*)
+				:
+			;;
+			
+		esac
+		
+		local folder="$noarch_download_folder_path"/"$distribution_root_folder"/"$date"
+		set +f
+			local file
+			for file in "$folder"/*
+			do
+				set -f
+				if [ ! -e "$file" ]; then
+					continue
+				fi
+				
+				mv "$file" "$target_specific_download_folder_path"/"$distribution_root_folder"/"$date"
+			done
+		set -f
+	
+		rmdir "$folder"
+			
+	done <"$nightly_dates_file_path"
+	
+	rmdir "$noarch_download_folder_path"/"$distribution_root_folder"
+	rmdir "$noarch_download_folder_path"
+	
+	mv "$target_specific_download_folder_path" "$server_folder_path"
+	
+	rmdir "$download_folder_path"
+}
+
+find_first_date()
+{
+	local date
+	while IFS=' ' read -r date junk
+	do
+		case "$date" in
+			
+			'')
+				continue
+			;;
+		
+			'#'*)
+				continue
+			;;
+		
+			*)
+				first_date="$date"
+				return 0
+			;;
+			
+		esac
+			
+	done <"$nightly_dates_file_path"
 }
 
 main()
 {
-	cd "$(_program_path_find)" 1>/dev/null 2>/dev/null
-	
-	. common.sh
-	. rust.sh
-	
 	local distribution_server
 	local distribution_root_folder
 	local configuration_folder_path
 	local download_folder_path
 	local rustup_version
-	rust_common_initialize "$(pwd)"
+	rust_common_initialize "$(pwd)"/rust
 	
 	local architecture
 	convert_target_platform
 	
 	local target_triple="$architecture"-unknown-linux-musl
 	
-	"$download_folder_path"/rustup/archive/"$rustup_version"/"$target_triple"/rustup-init
+	local nightly_dates_file_path="$configuration_folder_path"/'nightly'-dates
+	exit_if_configuration_file_missing "$nightly_dates_file_path"
+	
+	local server_folder_path="$(pwd)"/rust/server
+	move_files_into_place
+	
+	local first_date
+	find_first_date
+
+	"$server_folder_path"/rustup/archive/"$rustup_version"/"$target_triple"/rustup-init --quiet -y --no-update-default-toolchain --no-modify-path --default-host "$target_triple" --default-toolchain 'nightly'-"$first_date" --profile minimal
 }
 
 main "$@"

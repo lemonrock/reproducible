@@ -19,7 +19,7 @@ _exit_error_message()
 {
 	local code="$1"
 	local message="$2"
-	_exit_message $code "$1" 1>&2
+	_exit_message $code "$message" 1>&2
 }
 
 exit_error_message()
